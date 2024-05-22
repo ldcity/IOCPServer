@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+	<Type Name = "stChatLog">
+		<DisplayString>
+			{{idx={idx} shType={shType} playerAccountNo={playerAccountNo} packAccountNo={packAccountNo} iSessionID={iSessionID} isDisconn={isDisconn}}}
+		</DisplayString>
+	</Type>
+
+	<Type Name = "stNetLog">
+		<DisplayString>
+			{{idx={idx} sessionID={sessionID} ioCount={ioCount} socket={socket} disconFlag={disconFlag} type={type} start={start} end={end}}}
+		</DisplayString>
+	</Type>
+
+	<Type Name = "stRelease">
+		<DisplayString>
+			{{idx={idx} sessionIDPrev={sessionIDPrev} sessionIDCur={sessionIDCur} ioCountPrev={ioCountPrev} ioCountCur={ioCountCur} socketPrev={socketPrev} socketCur={socketCur} disconFlagPrev={disconFlagPrev} disconFlagCur={disconFlagCur} type={type} start={start} end={end}}}
+		</DisplayString>
+	</Type>
+
+	<Type Name = "stSendPacket">
+		<DisplayString>
+			{{idx={idx} sessionIDPrev={sessionIDPrev} sessionIDCur={sessionIDCur} ioCountPrev={ioCountPrev} ioCountCur={ioCountCur} socket={socket} packRefCnt={packRefCnt} disconFlagPrev={disconFlagPrev} disconFlagCur={disconFlagCur} type={type} start={start} end={end}}}
+		</DisplayString>
+	</Type>
+</AutoVisualizer>

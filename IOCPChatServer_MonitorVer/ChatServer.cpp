@@ -1,0 +1,868 @@
+#include "PCH.h"
+
+#include "ChatServer.h"
+
+
+// Job Worker Thread
+unsigned __stdcall JobWorkerThread(PVOID param)
+{
+	ChatServer* chatServ = (ChatServer*)param;
+
+	chatServ->JobWorkerThread_serv();
+
+	return 0;
+}
+
+// Worker Thread Call
+unsigned __stdcall MoniteringThread(void* param)
+{
+	ChatServer* chatServ = (ChatServer*)param;
+
+	chatServ->MoniterThread_serv();
+
+	return 0;
+}
+
+ChatServer::ChatServer() : startFlag(false)
+{
+
+}
+
+ChatServer::~ChatServer()
+{
+	chatLog->~Log();
+	logger->~Log();
+
+	if (m_mapPlayer.size() > 0)
+	{
+		for (auto iter = m_mapPlayer.begin(); iter != m_mapPlayer.end();)
+		{
+			playerPool.Free(iter->second);
+			iter = m_mapPlayer.erase(iter);
+		}
+	}
+
+	// m_Sector 삭제해야함
+
+	if (chatJobQ.GetSize() > 0)
+	{
+		ChatJob* job = nullptr;
+		while (chatJobQ.Dequeue(job))
+		{
+			jobPool.Free(job);
+		}
+	}
+
+	CloseHandle(m_jobHandle);
+	CloseHandle(m_jobEvent);
+	CloseHandle(m_moniteringThread);
+	CloseHandle(m_moniterEvent);
+	CloseHandle(m_runEvent);
+
+}
+
+bool ChatServer::ChatServerStart()
+{
+	SYSTEMTIME stNowTime;
+	GetLocalTime(&stNowTime);
+	wsprintfW(startTime, L"%d%02d%02d_%02d.%02d.%02d",
+		stNowTime.wYear, stNowTime.wMonth, stNowTime.wDay, stNowTime.wHour, stNowTime.wMinute, stNowTime.wSecond);
+
+	chatLog = new Log(L"ChatServer");
+
+	// chat server 설정파일 파싱
+	TextParser chatServerInfoTxt;
+
+	const wchar_t* txtName = L"ChatServer.txt";
+	chatServerInfoTxt.LoadFile(txtName);
+
+	wchar_t ip[16];
+	chatServerInfoTxt.GetValue(L"SERVER.BIND_IP", ip);
+
+	m_tempIp = ip;
+	int len = WideCharToMultiByte(CP_UTF8, 0, m_tempIp.c_str(), -1, NULL, 0, NULL, NULL);
+	string result(len - 1, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, m_tempIp.c_str(), -1, &result[0], len, NULL, NULL);
+	m_ip = result;
+
+	performMoniter.AddInterface(m_ip);
+
+	int port;
+	chatServerInfoTxt.GetValue(L"SERVER.BIND_PORT", &port);
+
+	int workerThread;
+	chatServerInfoTxt.GetValue(L"SERVER.IOCP_WORKER_THREAD", &workerThread);
+
+	int runningThread;
+	chatServerInfoTxt.GetValue(L"SERVER.IOCP_ACTIVE_THREAD", &runningThread);
+
+	int nagleOff;
+	chatServerInfoTxt.GetValue(L"SERVER.NAGLE_OFF", &nagleOff);
+
+	int sessionMAXCnt;
+	chatServerInfoTxt.GetValue(L"SERVER.SESSION_MAX", &sessionMAXCnt);
+
+	chatServerInfoTxt.GetValue(L"SERVER.USER_MAX", &m_userMAXCnt);
+
+	int packet_code;
+	chatServerInfoTxt.GetValue(L"SERVER.PACKET_CODE", &packet_code);
+
+	int packet_key;
+	chatServerInfoTxt.GetValue(L"SERVER.PACKET_KEY", &packet_key);
+
+	chatServerInfoTxt.GetValue(L"SERVICE.TIMEOUT_DISCONNECT", &m_timeout);
+
+	// Chatting Lan Client Start
+	lanClient.MonitoringLanClientStart();
+
+	bool ret = this->Start(ip, port, workerThread, runningThread, nagleOff, sessionMAXCnt, packet_code, packet_key);
+
+	if (!ret)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"NetServer Start Error");
+		return false;
+	}
+
+	// Create Manual Event
+	m_runEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (m_runEvent == NULL)
+	{
+		int eventError = WSAGetLastError();
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"CreateEvent() Error : %d", eventError);
+
+		return false;
+	}
+
+	// Create Auto Event
+	m_moniterEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (m_moniterEvent == NULL)
+	{
+		int eventError = WSAGetLastError();
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"CreateEvent() Error : %d", eventError);
+
+		return false;
+	}
+
+	// Create Auto Event
+	m_jobEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+	if (m_jobEvent == NULL)
+	{
+		int eventError = WSAGetLastError();
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"CreateEvent() Error : %d", eventError);
+
+		return false;
+	}
+
+	// Monitering Thread
+	m_moniteringThread = (HANDLE)_beginthreadex(NULL, 0, MoniteringThread, this, CREATE_SUSPENDED, NULL);
+	if (m_moniteringThread == NULL)
+	{
+		int threadError = GetLastError();
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"_beginthreadex() Error : %d", threadError);
+
+		return false;
+	}
+
+	chatLog->logger(dfLOG_LEVEL_DEBUG, __LINE__, L"Create Moniterting Thread");
+
+
+	// Job Worker Thread
+	m_jobHandle = (HANDLE)_beginthreadex(NULL, 0, JobWorkerThread, this, 0, NULL);
+	if (m_jobHandle == NULL)
+	{
+		int threadError = GetLastError();
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"_beginthreadex() Error : %d", threadError);
+
+		return false;
+	}
+
+	chatLog->logger(dfLOG_LEVEL_DEBUG, __LINE__, L"Create Job Worker Thread");
+
+	WaitForSingleObject(m_moniteringThread, INFINITE);
+	WaitForSingleObject(m_jobHandle, INFINITE);
+
+	return true;
+}
+
+bool ChatServer::ChatServerStop()
+{
+	// Sector & Player 객체 정리
+
+	// ChatServer 리소스 정리
+	CloseHandle(m_jobHandle);
+	CloseHandle(m_jobEvent);
+
+	// NetServer 종료
+	this->Stop();
+
+	return true;
+}
+
+// Monitering Thread
+bool ChatServer::MoniterThread_serv()
+{
+	DWORD threadID = GetCurrentThreadId();
+
+	while (true)
+	{
+		// 1초마다 모니터링 -> 타임아웃 건도 처리
+		DWORD ret = WaitForSingleObject(m_moniterEvent, 1000);
+
+		if (ret == WAIT_TIMEOUT)
+		{			
+			__int64 chatReq = InterlockedExchange64(&m_chattingReqTPS, 0);
+			__int64 chatRes = InterlockedExchange64(&m_chattingResTPS, 0);
+
+			// 모니터링 서버 전송용 데이터
+			__int64 iJobThreadUpdateCnt = InterlockedExchange64(&m_jobThreadUpdateCnt, 0);
+			__int64 iSessionCnt = sessionCnt;
+			__int64 iLoginPlayerCnt = m_loginPlayerCnt;
+
+			__int64 jobPoolCapacity = jobPool.GetCapacity();
+			__int64 jobPoolUseCnt = jobPool.GetObjectUseCount();
+			__int64 jobPoolAllocCnt = jobPool.GetObjectAllocCount();
+			__int64 jobPoolFreeCnt = jobPool.GetObjectFreeCount();
+
+			__int64 packetPoolCapacity = CPacket::GetPoolCapacity();
+			__int64 packetPoolUseCnt = CPacket::GetPoolUseCnt();
+			__int64 packetPoolAllocCnt = CPacket::GetPoolUseCnt();
+			__int64 packetPoolFreeCnt = CPacket::GetPoolUseCnt();
+
+			wprintf(L"==============================================================\n");
+			wprintf(L"%s\n", startTime);
+
+			wprintf(L"------------------------[Moniter]----------------------------\n");
+			performMoniter.PrintMonitorData();
+
+			wprintf(L"------------------------[Network]----------------------------\n");
+			wprintf(L"[Session              ] Total    : %10I64d\n", iSessionCnt);
+			wprintf(L"[Accept               ] Total    : %10I64d   TPS : %10I64d\n", acceptCount, InterlockedExchange64(&acceptTPS, 0));
+			wprintf(L"[Release              ] Total    : %10I64d   TPS : %10I64d\n", releaseCount, InterlockedExchange64(&releaseTPS, 0));
+			wprintf(L"[Recv Call            ] Total    : %10I64d   TPS : %10I64d\n", recvCallCount, InterlockedExchange64(&recvCallTPS, 0));
+			wprintf(L"[Send Call            ] Total    : %10I64d   TPS : %10I64d\n", sendCallCount, InterlockedExchange64(&sendCallTPS, 0));
+			wprintf(L"[Recv Bytes           ] Total    : %10I64d   TPS : %10I64d\n", recvBytes, InterlockedExchange64(&recvBytesTPS, 0));
+			wprintf(L"[Send Bytes           ] Total    : %10I64d   TPS : %10I64d\n", sendBytes, InterlockedExchange64(&sendBytesTPS, 0));
+			wprintf(L"[Recv  Packet         ] Total    : %10I64d   TPS : %10I64d\n", recvMsgCount, InterlockedExchange64(&recvMsgTPS, 0));
+			wprintf(L"[Send  Packet         ] Total    : %10I64d   TPS : %10I64d\n", sendMsgCount, InterlockedExchange64(&sendMsgTPS, 0));
+			wprintf(L"[Pending TPS          ] Recv     : %10I64d   Send: %10I64d\n", InterlockedExchange64(&recvPendingTPS, 0), InterlockedExchange64(&sendPendingTPS, 0));
+			wprintf(L"------------------------[Contents]----------------------------\n");
+			wprintf(L"[JobQ                 ] Size     : %10I64d\n", chatJobQ.GetSize());
+			wprintf(L"[Update               ] Enq Cnt  : %10I64d   Thread Cnt : %10I64d\n", InterlockedExchange64(&m_jobUpdatecnt, 0), iJobThreadUpdateCnt);
+			wprintf(L"[Job Pool             ] Capacity : %10llu   Use        : %10llu    Alloc : %10llu    Free : %10llu\n",
+				jobPoolCapacity, jobPoolUseCnt, jobPoolAllocCnt, jobPoolFreeCnt);
+			wprintf(L"[Player Pool          ] Capacity : %10llu   Use        : %10llu    Alloc : %10llu    Free : %10llu\n",
+				playerPool.GetCapacity(), playerPool.GetObjectUseCount(), playerPool.GetObjectAllocCount(), playerPool.GetObjectFreeCount());
+			wprintf(L"[Packet Pool          ] Capacity : %10llu   Use        : %10llu    Alloc : %10llu    Free : %10llu\n",
+				packetPoolCapacity, packetPoolUseCnt, packetPoolAllocCnt, packetPoolFreeCnt);
+			wprintf(L"[Packet List          ] Login    : %10I64d   SectorMove : %10I64d    Chat  : %10I64d (Aroung Avg : %.2f)\n",
+				InterlockedExchange64(&m_loginPacketTPS, 0), InterlockedExchange64(&m_sectorMovePacketTPS, 0), chatReq, (double)chatRes / chatReq);
+			wprintf(L"[Player               ] Create   : %10I64d   Login      : %10I64d\n", m_totalPlayerCnt, iLoginPlayerCnt);
+			wprintf(L"[Delete               ] Total    : %10I64d   TPS        : %10I64d\n", m_deletePlayerCnt, InterlockedExchange64(&m_deletePlayerTPS, 0));
+			wprintf(L"==============================================================\n\n");
+
+			// 모니터링 서버로 데이터 전송
+			int iTime = (int)time(NULL);
+			BYTE serverNo = SERVERTYPE::CHAT_SERVER_TYPE;
+
+			//// ChatServer 실행 여부 ON / OFF
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SERVER_RUN, true, iTime);
+
+			//// ChatServer CPU 사용률
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SERVER_CPU, (int)performMoniter.GetProcessCpuTotal(), iTime);
+
+			//// ChatServer 메모리 사용 MByte
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SERVER_MEM, (int)performMoniter.GetProcessUserMemoryByMB(), iTime);
+
+			//// ChatServer 세션 수 (컨넥션 수)
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SESSION, (int)iSessionCnt, iTime);
+
+			//// ChatServer 인증성공 사용자 수 (실제 접속자)
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_PLAYER, (int)iLoginPlayerCnt, iTime);
+			//
+			//// ChatServer UPDATE 스레드 초당 초리 횟수
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_UPDATE_TPS, (int)iJobThreadUpdateCnt, iTime);
+
+			//// ChatServer 패킷풀 사용량
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_PACKET_POOL, (int)packetPoolUseCnt, iTime);
+
+			//// ChatServer UPDATE MSG 풀 사용량
+			//lanClient.SendDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_UPDATEMSG_POOL, (int)jobPoolUseCnt, iTime);
+
+
+			// ChatServer 실행 여부 ON / OFF
+			CPacket* onPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SERVER_RUN, true, iTime, onPacket);
+			lanClient.SendPacket(onPacket);
+			CPacket::Free(onPacket);
+
+			// ChatServer CPU 사용률
+			CPacket* cpuPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SERVER_CPU, (int)performMoniter.GetProcessCpuTotal(), iTime, cpuPacket);
+			lanClient.SendPacket(cpuPacket);
+			CPacket::Free(cpuPacket);
+
+			// ChatServer 메모리 사용 MByte
+			CPacket* memoryPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SERVER_MEM, (int)performMoniter.GetProcessUserMemoryByMB(), iTime, memoryPacket);
+			lanClient.SendPacket(memoryPacket);
+			CPacket::Free(memoryPacket);
+
+			// ChatServer 세션 수 (컨넥션 수)
+			CPacket* sessionPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_SESSION, (int)iSessionCnt, iTime, sessionPacket);
+			lanClient.SendPacket(sessionPacket);
+			CPacket::Free(sessionPacket);
+
+			// ChatServer 인증성공 사용자 수 (실제 접속자)
+			CPacket* authPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_PLAYER, (int)iLoginPlayerCnt, iTime, authPacket);
+			lanClient.SendPacket(authPacket);
+			CPacket::Free(authPacket);
+
+			// ChatServer UPDATE 스레드 초당 초리 횟수
+			CPacket* updataPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_UPDATE_TPS, (int)iJobThreadUpdateCnt, iTime, updataPacket);
+			lanClient.SendPacket(updataPacket);
+			CPacket::Free(updataPacket);
+
+			// ChatServer 패킷풀 사용량
+			CPacket* poolPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_PACKET_POOL, (int)packetPoolUseCnt, iTime, poolPacket);
+			lanClient.SendPacket(poolPacket);
+			CPacket::Free(poolPacket);
+
+			// ChatServer UPDATE MSG 풀 사용량
+			CPacket* jobPacket = CPacket::Alloc();
+			lanClient.mpUpdateDataToMonitorServer(serverNo, MONITOR_DATA_TYPE_CHAT_UPDATEMSG_POOL, (int)jobPoolUseCnt, iTime, jobPacket);
+			lanClient.SendPacket(jobPacket);
+			CPacket::Free(jobPacket);
+		}
+	}
+
+	return true;
+}
+
+bool ChatServer::JobWorkerThread_serv()
+{
+	DWORD threadID = GetCurrentThreadId();
+
+	while (true)
+	{
+
+		// JobQ에 Job이 삽입되면 이벤트 발생하여 깨어남
+		WaitForSingleObject(m_jobEvent, INFINITE);
+
+		ChatJob* chatJob = nullptr;
+
+		while (chatJobQ.GetSize() > 0)
+		{
+			if (chatJobQ.Dequeue(chatJob))
+			{
+				// 분기 처리
+				switch (chatJob->type)
+				{
+				case JobType::NEW_CONNECT:
+				{
+					CreatePlayer(chatJob->sessionID);
+				}
+					break;
+
+				case JobType::DISCONNECT:
+				{
+					DeletePlayer(chatJob->sessionID);
+				}
+					break;
+
+				case JobType::MSG_PACKET:
+					PacketProc(chatJob->sessionID, chatJob->packet);
+					break;
+
+				default:
+					DisconnectSession(chatJob->sessionID);
+					break;
+				}
+
+				// 접속, 해제 Job은 packet nullptr
+				if (chatJob->packet != nullptr)
+					CPacket::Free(chatJob->packet);
+
+				jobPool.Free(chatJob);
+
+				InterlockedIncrement64(&m_jobThreadUpdateCnt);
+			}
+		}
+	}
+}
+
+bool ChatServer::PacketProc(uint64_t sessionID, CPacket* packet)
+{
+	WORD type;
+	*packet >> type;
+
+	switch (type)
+	{
+	case en_PACKET_CS_CHAT_REQ_LOGIN:
+	{
+		netPacketProc_Login(sessionID, packet);					// 로그인 요청
+	}
+		break;
+	case en_PACKET_CS_CHAT_REQ_SECTOR_MOVE:
+	{
+		netPacketProc_SectorMove(sessionID, packet);			// 섹터 이동 요청
+	}
+		break;
+	case en_PACKET_CS_CHAT_REQ_MESSAGE:
+	{
+		netPacketProc_Chatting(sessionID, packet);				// 채팅 보내기
+	}
+		break;
+	case en_PACKET_CS_CHAT_REQ_HEARTBEAT:
+		netPacketProc_HeartBeat(sessionID, packet);				// 하트비트
+		break;
+	default:
+		// 잘못된 패킷
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Packet Type Error > %d", type);
+		DisconnectSession(sessionID);
+		break;
+	}
+
+	return true;
+}
+
+bool ChatServer::OnConnectionRequest(const wchar_t* IP, unsigned short PORT)
+{
+
+	return true;
+}
+
+// 접속 처리 - 이 때 Player 껍데기를 미리 만들어놔야함
+// 로그인 전에 연결만 된 세션에 대해 timeout도 판단해야하기 때문에
+void ChatServer::OnClientJoin(uint64_t sessionID)
+{
+	if (!startFlag)
+	{
+		ResumeThread(m_moniteringThread);
+		startFlag = true;
+	}
+
+	ChatJob* job = jobPool.Alloc();
+	job->type = JobType::NEW_CONNECT;
+	job->sessionID = sessionID;
+	job->packet = nullptr;
+
+	chatJobQ.Enqueue(job);
+	InterlockedIncrement64(&m_jobUpdatecnt);
+	SetEvent(m_jobEvent);
+}
+
+// 해제 처리
+void ChatServer::OnClientLeave(uint64_t sessionID)
+{
+	ChatJob* job = jobPool.Alloc();
+	job->type = JobType::DISCONNECT;
+	job->sessionID = sessionID;
+	job->packet = nullptr;
+
+	chatJobQ.Enqueue(job);
+	InterlockedIncrement64(&m_jobUpdatecnt);
+	SetEvent(m_jobEvent);
+}
+
+// 패킷 처리
+void ChatServer::OnRecv(uint64_t sessionID, CPacket* packet)
+{
+	ChatJob* job = jobPool.Alloc();
+	job->type = JobType::MSG_PACKET;
+	job->sessionID = sessionID;
+	job->packet = packet;
+
+	chatJobQ.Enqueue(job);
+	InterlockedIncrement64(&m_jobUpdatecnt);
+	SetEvent(m_jobEvent);
+}
+
+void ChatServer::OnError(int errorCode, const wchar_t* msg)
+{
+
+}
+
+
+//--------------------------------------------------------------------------------------
+// player 관련 함수
+//--------------------------------------------------------------------------------------
+
+// player 생성
+bool ChatServer::CreatePlayer(uint64_t sessionID)
+{
+	Player* player = playerPool.Alloc();
+
+	if (player == nullptr)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Player Pool Alloc Failed!");
+
+		CRASH();
+
+		return false;
+	}
+
+	player->sessionID = sessionID;
+	player->accountNo = -1;
+
+	memset(player->sessionKey, 0, MSG_MAX_LEN);
+	wmemset(player->ID, 0, ID_MAX_LEN);
+	wmemset(player->nickname, 0, NICKNAME_MAX_LEN);
+
+	player->sectorX = -1;
+	player->sectorY = -1;
+
+	player->recvLastTime = timeGetTime();
+
+	m_mapPlayer.insert({ sessionID, player });
+
+	InterlockedIncrement64(&m_totalPlayerCnt);
+
+	return true;
+}
+
+// player 삭제
+bool ChatServer::DeletePlayer(uint64_t sessionID)
+{
+	Player* player = FindPlayer(sessionID);
+
+	if (player == nullptr)
+	{
+		chatLog->logger(dfLOG_LEVEL_DEBUG, __LINE__, L"DeletePlayer # Player Not Found! ID : %016llx", sessionID);
+		CRASH()
+		return false;
+	}
+
+	// 섹터에서 해당 player 객체 삭제
+	// Sector 이동도 하지 않은 상태면 x,y 좌표가 -1 -> x,y 좌표 둘 다 -1이 아니면 섹터에 플레이어 있음
+	if (player->sectorX != -1 && player->sectorY != -1)
+	{
+		m_Sector[player->sectorY][player->sectorX].erase(player);
+	}
+
+	player->recvLastTime = timeGetTime();
+
+	m_mapPlayer.erase(player->sessionID);
+
+	auto accountIter = m_accountNo.equal_range(player->accountNo);
+
+	for (; accountIter.first != accountIter.second;)
+	{
+		// 이 중복건에 대해서는 (acocuntNo는 같으나 sessionID가 다름)
+		if (player->sessionID != accountIter.first->second)
+		{
+			chatLog->logger(dfLOG_LEVEL_DEBUG, __LINE__, L"DeletePlayer # duplicated > prevID : %016llx\tcurID : %016llx\tprevAccountNo : %IId\tcurAccountNo : %IId",
+				accountIter.first->second, player->sessionID, accountIter.first->first, player->accountNo);
+			++accountIter.first;
+		}
+		else
+		{
+			accountIter.first = m_accountNo.erase(accountIter.first);
+
+			InterlockedDecrement64(&m_loginPlayerCnt);
+			InterlockedIncrement64(&m_deletePlayerCnt);
+			InterlockedIncrement64(&m_deletePlayerTPS);
+
+			break;
+		}
+	}
+
+	playerPool.Free(player);
+
+	InterlockedDecrement64(&m_totalPlayerCnt);
+
+	return true;
+}
+
+//--------------------------------------------------------------------------------------
+// Packet Proc
+//--------------------------------------------------------------------------------------
+
+// 로그인 요청
+void ChatServer::netPacketProc_Login(uint64_t sessionID, CPacket* packet)
+{
+	INT64 _accountNo = 0;
+	BYTE status = true;
+
+	// 예외 처리 - 156 
+	if (packet->GetDataSize() < sizeof(INT64) + ID_MAX_LEN * sizeof(wchar_t) + NICKNAME_MAX_LEN * sizeof(wchar_t) + MSG_MAX_LEN * sizeof(char))
+	{
+		int size = packet->GetDataSize();
+
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Login Request Packet > Size Error : %d", size);
+
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	*packet >> _accountNo;
+
+	// player 찾기
+	Player* player = FindPlayer(sessionID);
+
+	// error -> 존재하지 않는 세션에 접근하려함
+	if (player == nullptr)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Login # %016llx Player Not Found!", sessionID);
+		status = false;
+	}
+	else
+	{
+		CheckPlayer(player, _accountNo);
+
+		m_accountNo.insert({ _accountNo, sessionID });
+
+		player->recvLastTime = timeGetTime();
+		player->accountNo = _accountNo;
+		packet->GetData((char*)player->ID, ID_MAX_LEN * sizeof(wchar_t));
+		packet->GetData((char*)player->nickname, NICKNAME_MAX_LEN * sizeof(wchar_t));
+
+		// Login Server 개발 시, 로직 변경 (인증 절차)
+		packet->GetData((char*)player->sessionKey, MSG_MAX_LEN);
+
+		InterlockedIncrement64(&m_loginPacketTPS);
+		InterlockedIncrement64(&m_loginPlayerCnt);
+	}
+
+	// 로그인 응답 패킷 전송
+	CPacket* resLoginPacket = CPacket::Alloc();
+
+	mpResLogin(resLoginPacket, status, _accountNo);
+
+	SendPacket(sessionID, resLoginPacket);
+
+	CPacket::Free(resLoginPacket);
+}
+// 섹터 이동 요청
+void ChatServer::netPacketProc_SectorMove(uint64_t sessionID, CPacket* packet)
+{
+	INT64 accountNo;
+	short sectorX;
+	short sectorY;
+
+	// 예외 처리 -> 12
+	if (packet->GetDataSize() < sizeof(INT64) + sizeof(WORD) * 2)
+	{
+		int size = packet->GetDataSize();
+
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Move Sector Request Packet > Size Error : %d", size);
+	
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	*packet >> accountNo >> sectorX >> sectorY;
+
+	// Player 검색
+	Player* player = FindPlayer(sessionID);
+
+	// Player가 없는데 패킷이 들어온다???? -> error
+	if (player == nullptr)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Move Sector Request Packet > Player Not Found");
+
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	// accountNo 확인
+	if (player->accountNo != accountNo)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Move Sector Request Packet > AccountNo Not Equal");
+
+		DisconnectSession(player->sessionID);
+
+		return;
+	}
+
+	// 섹터 범위 확인
+	if (sectorX >= dfSECTOR_X_MAX || sectorX < 0 || sectorY >= dfSECTOR_Y_MAX || sectorY < 0)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Move Sector Request Packet > Sector Bound Error");
+
+		DisconnectSession(player->sessionID);
+
+		return;
+	}
+
+	player->recvLastTime = timeGetTime();
+
+	// 해당 섹터에 player있는지 확인
+	// 만약 현재 섹터 좌표가 -1이 아니면 처음 움직이는 게 아니므로 현재 섹터에 있는 player 객체 삭제해야함
+	if (player->sectorX != -1 && player->sectorY != -1)
+	{
+		// 이전 섹터좌표와도 다를 경우, 이전 섹터좌표 값 삭제
+		if (player->sectorX != sectorX || player->sectorY != sectorY)
+		{
+			auto iter = m_Sector[player->sectorY][player->sectorX].find(player);
+
+			// 섹터 이동 전에 객체 삭제
+			if (iter != m_Sector[player->sectorY][player->sectorX].end())
+			{
+				m_Sector[player->sectorY][player->sectorX].erase(iter);
+			}
+
+			// 이전 섹터에 있던 내 player 객체 삭제 후(or 처음 움직임) 현재 섹터 위치에 추가
+			player->sectorX = sectorX;
+			player->sectorY = sectorY;
+
+			m_Sector[player->sectorY][player->sectorX].emplace(player);
+		}
+	}
+	// 처음 좌표 이동 시, 해당 좌표에 객체 추가
+	else
+	{
+		player->sectorX = sectorX;
+		player->sectorY = sectorY;
+
+		// 섹터 위치에 추가
+		m_Sector[player->sectorY][player->sectorX].emplace(player);
+	}
+
+	InterlockedIncrement64(&m_sectorMovePacketTPS);
+
+	CPacket* resPacket = CPacket::Alloc();
+
+	mpResSectorMove(resPacket, player->accountNo, player->sectorX, player->sectorY);
+
+	SendPacket(sessionID, resPacket);
+
+	CPacket::Free(resPacket);
+}
+
+// 채팅 보내기
+void ChatServer::netPacketProc_Chatting(uint64_t sessionID, CPacket* packet)
+{
+	// Player 검색
+	Player* player = FindPlayer(sessionID);
+
+	// Player가 없는데 패킷이 들어온다???? -> error
+	if (player == nullptr)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Chatting Request Packet > Player Not Found");
+
+		CRASH();
+
+		return;
+	}
+
+	// 예외 처리
+	if (packet->GetDataSize() < sizeof(INT64) + sizeof(WORD) + sizeof(wchar_t))
+	{
+		int size = packet->GetDataSize();
+
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Chatting Request Packet > Size Error : %d", size);
+
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	INT64 accountNo;
+	WORD msgLen;
+	WCHAR* message;
+
+	*packet >> accountNo;
+
+	// accountNo가 다른 경우
+	if (accountNo != player->accountNo)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Chatting Request Packet > account Error\tplayer: %IId\tpacket : %IId",
+			player->accountNo, accountNo);
+
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	*packet >> msgLen;
+
+	// 헤더 페이로드 크기와 실제 페이로드 크기가 다른 경우
+	if (packet->GetDataSize() != msgLen)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Chatting Request Packet > Payload Size Error : %d", msgLen);
+
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	player->recvLastTime = timeGetTime();
+
+	// 섹터 범위 확인
+	if (player->sectorX >= dfSECTOR_X_MAX || player->sectorX < 0 || player->sectorY >= dfSECTOR_Y_MAX || player->sectorY < 0)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"Chatting Request Packet > Sector Bound Error");
+
+		DisconnectSession(player->sessionID);
+
+		return;
+	}
+
+	InterlockedIncrement64(&m_chattingReqTPS);
+
+	CPacket* resPacket = CPacket::Alloc();
+
+	mpResChatMessage(resPacket, player->accountNo, player->ID, player->nickname, msgLen, (WCHAR*)packet->GetReadBufferPtr());
+	packet->MoveReadPos(msgLen);
+
+	// player 객체 주변 섹터 구하기
+	st_SECTOR_AROUND sectorAround;
+	GetSectorAround(player->sectorX, player->sectorY, &sectorAround);
+
+	// PQCS로 SendPost를 호출하므로 packet 참조카운트 증가시켜야 함
+	// PQCS 사용하지 않고 일반 single thread로 잡 처리하면 증가안시켜도 됨
+	
+	//resPacket->addRefCnt();
+	for (int i = 0; i < sectorAround.iCount; i++)
+	{
+		auto iter = m_Sector[sectorAround.Around[i].y][sectorAround.Around[i].x].begin();
+		for (; iter != m_Sector[sectorAround.Around[i].y][sectorAround.Around[i].x].end();)
+		{
+			Player* otherPlayer = *iter;
+			++iter;
+
+			InterlockedIncrement64(&m_chattingResTPS);
+
+			SendPacket(otherPlayer->sessionID, resPacket);
+		}
+	}
+
+	//resPacket->subRefCnt();
+	CPacket::Free(resPacket);
+}
+
+// 하트비트
+void ChatServer::netPacketProc_HeartBeat(uint64_t sessionID, CPacket* packet)
+{
+	// 예외 처리 -> 하트비트 패킷은 타입 외에 추가적인 데이터가 있으면 안됨
+	if (packet->GetDataSize() > 0)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"HeartBeat Request Packet > Packet is not empty");
+
+		DisconnectSession(sessionID);
+
+		return;
+	}
+
+	// Player 검색
+	Player* player = FindPlayer(sessionID);
+
+	// Player가 없는데 패킷이 들어온다???? -> error
+	if (player == nullptr)
+	{
+		chatLog->logger(dfLOG_LEVEL_ERROR, __LINE__, L"HeartBeat Request Packet > Player Not Found");
+
+		CRASH();
+
+		return;
+	}
+
+	player->recvLastTime = timeGetTime();
+}

@@ -1,0 +1,41 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals">
+    <MSBuildAllProjects Condition="'$(MSBuildVersion)' == '' Or '$(MSBuildVersion)' &lt; '16.0'">$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects>
+    <HasSharedItems>true</HasSharedItems>
+    <ItemsProjectGuid>{2602f123-558a-4889-b591-edb0d91e4431}</ItemsProjectGuid>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(MSBuildThisFileDirectory)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ProjectCapability Include="SourceItemsFromImports" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="$(MSBuildThisFileDirectory)..\IOCPNetServer\NetServer.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)CrashDump.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)Define.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)Exception.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)FreeList.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)LockFreeFreeList.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)LockFreeQueue.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)LockFreeStack.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)Packet.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)Profiling.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)Protocol.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)RingBuffer.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)Session.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)TextParser.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)TLSFreeList.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\IOCPNetServer\NetServer.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Exception.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Packet.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Profiling.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)RingBuffer.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)TextParser.cpp" />
+  </ItemGroup>
+</Project>

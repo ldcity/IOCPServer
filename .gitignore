@@ -361,3 +361,14 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# OMC session state (user-owned, not committed)
+.omc/
+
+# 외부에서 제공받은 강의/과제 자료 — 로컬에만 보관하고 저장소에는 포함하지 않는다
+_Mail/
+PerformanceMonitor/*.pdf
+LanServer_StressTest_20191125.exe
+iocp_StressTest.txt
+NetServer Packet Encode,header.txt
+LanServer_LanClient 외형.txt
